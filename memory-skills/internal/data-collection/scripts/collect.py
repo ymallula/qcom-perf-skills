@@ -747,16 +747,34 @@ def parse_modules(text: str) -> dict:
 
 
 def parse_iomem(text: str) -> dict:
-    """Parse /proc/iomem to extract System RAM ranges."""
+    """
+    Parse /proc/iomem to extract System RAM ranges plus the full region
+    hierarchy (including depth/indentation), used to build the physical
+    Memory Layout (System RAM blocks, kernel-reserved sub-regions, and gaps).
+    """
     ranges = []
+    regions = []
     for line in text.splitlines():
-        m = re.match(r"([0-9a-f]+)-([0-9a-f]+)\s*:\s*System RAM", line, re.I)
-        if m:
+        m = re.match(r"^(\s*)([0-9a-f]+)-([0-9a-f]+)\s*:\s*(.+)$", line, re.I)
+        if not m:
+            continue
+        depth = len(m.group(1)) // 2
+        start = int(m.group(2), 16)
+        end = int(m.group(3), 16)
+        name = m.group(4).strip()
+        regions.append({
+            "start": start,
+            "end": end,
+            "size_kb": (end - start + 1) // 1024,
+            "name": name,
+            "depth": depth,
+        })
+        if depth == 0 and name == "System RAM":
             ranges.append({
-                "start": "0x" + m.group(1),
-                "end": "0x" + m.group(2),
+                "start": "0x" + m.group(2),
+                "end": "0x" + m.group(3),
             })
-    return {"system_ram_ranges": ranges}
+    return {"system_ram_ranges": ranges, "regions": regions}
 
 
 # ---------------------------------------------------------------------------
@@ -887,25 +905,56 @@ def parse_zramstat(text: str) -> dict:
 
 def parse_memblock(text: str) -> dict:
     """
-    Parse /sys/kernel/debug/memblock/memory.
-    Each line: idx  base  size  [flags]
-    Returns total physical RAM in kB.
+    Parse /sys/kernel/debug/memblock/memory (or .../reserved).
+
+    Two kernel formats are supported:
+
+    1. Current kernels print an inclusive start..end range, e.g.
+           0: 0x0000000081a60000..0x0000000081bbffff    0 NONE
+       Fields: idx: 0xSTART..0xEND  nid  flags
+
+    2. Older kernels print base and size as separate hex fields, e.g.
+           0: 0x0000000081a60000 0x0000000000160000 0
+       Fields: idx: base size [flags]
+
+    The start..end form must be detected first: naively reading the third
+    whitespace-separated field as a "size" on a modern kernel yields the nid
+    (0), so every region is computed as zero-sized and the whole source
+    silently degrades to an empty list.
+
+    Returns {"total_kb": int, "regions": [{"base": hex, "size_kb": int}]}.
     """
     total_kb = 0
     regions = []
     for line in text.splitlines():
         line = line.strip()
-        if not line or line.startswith("cnt") or line.startswith("idx"):
+        if not line or line.lower().startswith(("cnt", "idx", "size")):
             continue
-        parts = line.split()
-        if len(parts) >= 3:
-            try:
-                base = int(parts[1], 16)
-                size = int(parts[2], 16)
-                total_kb += size // 1024
-                regions.append({"base": hex(base), "size_kb": size // 1024})
-            except (ValueError, IndexError):
-                continue
+
+        base = None
+        size = None
+
+        # Format 1: "idx: 0xSTART..0xEND" (end is inclusive)
+        m = re.match(r"^\d+:\s*0x([0-9a-fA-F]+)\.\.0x([0-9a-fA-F]+)", line)
+        if m:
+            base = int(m.group(1), 16)
+            end  = int(m.group(2), 16)
+            size = end - base + 1
+        else:
+            # Format 2: "idx: base size [flags]"
+            parts = line.split()
+            if len(parts) >= 3:
+                try:
+                    base = int(parts[1], 16)
+                    size = int(parts[2], 16)
+                except (ValueError, IndexError):
+                    continue
+
+        if base is None or not size or size <= 0:
+            continue
+        total_kb += size // 1024
+        regions.append({"base": hex(base), "size_kb": size // 1024})
+
     return {"total_kb": total_kb, "regions": regions}
 
 

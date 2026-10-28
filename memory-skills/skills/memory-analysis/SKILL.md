@@ -435,6 +435,38 @@ current/snapshot.json + reference/snapshot.json
 
 ---
 
+## Interpreting the Report
+
+### Memory Layout section
+
+Every generated report includes a collapsible **Memory Layout** section (its
+own top-level card, a sibling of the Memory Summary) showing the
+address-ordered physical memory map: System RAM blocks, kernel code/data
+sections, generic reserved carve-outs, named NHLOS carve-outs, and any
+unaccounted address gaps ("Missing" rows). Five filter pills (NHLOS /
+Reserved / System RAM / Kernel / Missing) let you isolate a category; the
+Total row recomputes live from the currently visible rows.
+
+This table's Total must never exceed `Total RAM` shown in the Memory
+Summary above it; it typically lands a few MB below because carve-outs are
+rounded to whole MB. See
+`internal/snapshot-comparison/references/REFERENCE.md` for the full
+derivation (DRAM bank bounding, carve-out de-duplication, inter-bank gap
+suppression) and the invariants enforced to keep PCIe/MMIO address-space
+apertures out of the physical memory map.
+
+The Memory Layout section requires `/sys/kernel/debug/memblock/memory`
+(pulled automatically by `data-collection`) to correctly exclude PCIe
+BAR/ECAM apertures. If memblock is unavailable (debugfs not mounted), the
+layout falls back to the extents of `/proc/iomem`'s `System RAM` entries,
+which is correct for most boards but less precise on boards with large
+PCIe windows.
+
+It is also written to a dedicated `MemoryLayout` sheet in the unified XLSX
+report (when `--format xlsx` is used).
+
+---
+
 ## Error Handling
 
 - **Device not connected:** Inform the user and stop. Run `adb devices` to verify.

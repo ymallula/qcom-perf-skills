@@ -249,6 +249,38 @@ function showBatch(batchCls, nextToggleId, currentToggleId) {
     if (nxt) nxt.style.display = '';
   }
 }
+function filterMemoryLayout(tableId) {
+  var table = document.getElementById(tableId);
+  if (!table) return;
+  var checked = Array.prototype.slice.call(
+    document.querySelectorAll("input.memlayout-filter[data-table='" + tableId + "']:checked")
+  ).map(function(cb) { return cb.value; });
+  var rows = table.querySelectorAll('tr.memlayout-row');
+  // Recompute the Total row from only the currently-visible rows so the
+  // footer always reflects the active filter selection. Every visible row
+  // contributes (including "Missing" unaccounted-gap rows) so that the
+  // totals always add up to what is actually displayed.
+  var tSize = 0, tSys = 0, tCarv = 0, shown = 0;
+  rows.forEach(function(row) {
+    var show = checked.length === 0 || checked.indexOf(row.getAttribute('data-type')) !== -1;
+    row.style.display = show ? '' : 'none';
+    if (show) {
+      shown++;
+      tSize += parseFloat(row.getAttribute('data-size')     || '0');
+      tSys  += parseFloat(row.getAttribute('data-sysram')   || '0');
+      tCarv += parseFloat(row.getAttribute('data-carveout') || '0');
+    }
+  });
+  var setTxt = function(id, val) {
+    var el = document.getElementById(id);
+    if (el) el.textContent = val.toFixed(2);
+  };
+  setTxt(tableId + '-total-size', tSize);
+  setTxt(tableId + '-total-sysram', tSys);
+  setTxt(tableId + '-total-carveout', tCarv);
+  var cnt = document.getElementById(tableId + '-shown-count');
+  if (cnt) cnt.textContent = shown;
+}
 </script>
 """
 
@@ -1102,6 +1134,154 @@ def render_top_processes_details_html(
 {processes_html}"""
 
 
+# Ordered list of (region_type, display_label, accent_color) for the
+# Memory Layout filter checkboxes and row styling. Order controls the
+# left-to-right order of the checkboxes.
+MEMORY_LAYOUT_CATEGORIES = [
+    ("nhlos",    "NHLOS",      "#6f42c1"),
+    ("reserved", "Reserved",   "#e6a817"),
+    ("sysram",   "System RAM", "#28a745"),
+    ("kernel",   "Kernel",     "#2c6fad"),
+    ("missing",  "Missing",    "#c00000"),
+]
+
+
+def render_memory_layout_html(st: dict) -> str:
+    """
+    Render the physical Memory Layout section (System RAM blocks, kernel
+    code/data sections, generic reserved sub-regions, and NHLOS carve-outs
+    with address gaps marked as "Missing"), mirroring the reference
+    memmap_Parser.py "MemoryLayout" Excel sheet. Uses the current
+    snapshot's layout only (a physical memory map is a snapshot property,
+    not something that is diffed between two runs).
+
+    Includes 5 filter checkboxes (NHLOS / Reserved / System RAM / Kernel /
+    Missing) rendered horizontally above the table. Checking one or more
+    boxes filters the table to show only rows of the checked type(s);
+    with none checked, all rows are shown (default).
+    """
+    layout = st.get("current", {}).get("memory_layout", [])
+    if not layout:
+        return ""
+
+    ROW_STYLE = {
+        "sysram":   "background:#e8f8e8",             # green -- accessible System RAM
+        "kernel":   "background:#eef2ff",             # light purple -- kernel code/data section
+        "reserved": "background:#fff8e6",             # light amber -- generic reserved carve-out
+        "nhlos":    "background:#fff",                # default -- NHLOS carve-out
+        "missing":  "background:#fde8e8;font-weight:bold;color:#c00",  # red -- address gap
+    }
+
+    table_id = "mem-layout-tbl"
+
+    rows = ""
+    total_sysram_mb = 0.0
+    total_carveout_mb = 0.0
+    total_mb = 0.0
+    for name, start, end, size_mb, region_type in layout:
+        style = ROW_STYLE.get(region_type, "")
+        is_sysram = (region_type == "sysram")
+        sysram_mb = size_mb if is_sysram else 0
+        # Everything that is not accessible System RAM counts toward the
+        # carve-out column -- including "Missing" rows, which are small
+        # unaccounted gaps *within* the physical RAM range (real reserved
+        # space the kernel doesn't attribute to a named region). This
+        # matches the reference memmap_Parser.py behaviour.
+        #
+        # Note: large multi-GB address-space holes between physically
+        # discontiguous DDR banks are NOT emitted as "Missing" rows at all
+        # (they are dropped upstream in build_memory_layout() by the 1 GB
+        # GAP_THRESHOLD_MB filter), so accumulating Missing here cannot
+        # inflate the Total beyond the board's real RAM size.
+        carveout_mb = size_mb if not is_sysram else 0
+        total_sysram_mb += sysram_mb
+        total_carveout_mb += carveout_mb
+        total_mb += size_mb
+        # data-* attributes are read by filterMemoryLayout() to recompute the
+        # Total row from only the currently-visible (filtered) rows.
+        rows += (
+            f"<tr class='memlayout-row' data-type='{region_type}' "
+            f"data-size='{size_mb:.2f}' data-sysram='{sysram_mb:.2f}' "
+            f"data-carveout='{carveout_mb:.2f}' style='{style}'>"
+            f"<td style='padding:5px 10px'>{name}</td>"
+            f"<td style='padding:5px 10px;font-family:monospace;font-size:12px'>{hex(start)}</td>"
+            f"<td style='padding:5px 10px;font-family:monospace;font-size:12px'>{hex(end)}</td>"
+            f"<td style='padding:5px 10px;text-align:right'>{size_mb:.2f}</td>"
+            f"<td style='padding:5px 10px;text-align:right'>{sysram_mb:.2f}</td>"
+            f"<td style='padding:5px 10px;text-align:right'>{carveout_mb:.2f}</td>"
+            f"</tr>\n"
+        )
+
+    # Total footer -- values carry element IDs so the filter JS can update
+    # them live as categories are checked/unchecked.
+    rows += (
+        f"<tr class='memlayout-total-row' style='background:#d0dff0;font-weight:bold'>"
+        f"<td style='padding:6px 10px'>Total</td>"
+        f"<td style='padding:6px 10px'></td>"
+        f"<td style='padding:6px 10px'></td>"
+        f"<td style='padding:6px 10px;text-align:right'>"
+        f"<span id='{table_id}-total-size'>{total_mb:.2f}</span></td>"
+        f"<td style='padding:6px 10px;text-align:right'>"
+        f"<span id='{table_id}-total-sysram'>{total_sysram_mb:.2f}</span></td>"
+        f"<td style='padding:6px 10px;text-align:right'>"
+        f"<span id='{table_id}-total-carveout'>{total_carveout_mb:.2f}</span></td>"
+        f"</tr>\n"
+    )
+
+    # Build the horizontal row of filter checkboxes, one per category.
+    # Counts are shown next to each label for quick reference.
+    type_counts: dict = {}
+    for _n, _s, _e, _mb, rtype in layout:
+        type_counts[rtype] = type_counts.get(rtype, 0) + 1
+
+    # Each checkbox is a flex item with flex:1 so the five pills share the
+    # full width of the table equally (equidistant), regardless of label length.
+    checkboxes_html = ""
+    for rtype, label, color in MEMORY_LAYOUT_CATEGORIES:
+        count = type_counts.get(rtype, 0)
+        checkboxes_html += (
+            f"<label style='flex:1 1 0;display:inline-flex;align-items:center;"
+            f"justify-content:center;gap:7px;padding:9px 10px;"
+            f"border:1.5px solid {color};border-radius:22px;cursor:pointer;"
+            f"font-size:12.5px;font-weight:600;color:{color};background:#fff;"
+            f"user-select:none;white-space:nowrap;"
+            f"box-shadow:0 1px 3px rgba(20,50,90,0.07);transition:background 0.12s ease'>"
+            f"<input type='checkbox' class='memlayout-filter' value='{rtype}' "
+            f"data-table='{table_id}' style='accent-color:{color};cursor:pointer;margin:0' "
+            f"onchange=\"filterMemoryLayout('{table_id}')\">"
+            f"{label} <span style='opacity:0.6;font-weight:400'>({count})</span>"
+            f"</label>\n"
+        )
+
+    return f"""
+<div style='max-width:900px;margin:0 auto'>
+<div style='display:flex;align-items:stretch;gap:12px;margin:0 0 14px'>
+{checkboxes_html}
+</div>
+<p style='color:#888;font-size:12px;margin:0 0 8px'>
+  Showing <b id='{table_id}-shown-count' style='color:#2c6fad'>{len(layout)}</b>
+  of {len(layout)} regions -- physical address map (System RAM blocks, kernel
+  code/data sections, reserved carve-outs, and NHLOS carve-outs, sorted by address).
+  Totals below update with the selected filters.
+</p>
+<div style='max-height:600px;overflow-y:auto;border:1px solid #d5e0ec;border-radius:6px'>
+<table id='{table_id}' style='width:100%;border-collapse:collapse;font-size:13px;margin:0'>
+<thead><tr style='background:#2c6fad;color:white'>
+  <th style='padding:6px 10px;text-align:left'>Region Name</th>
+  <th style='padding:6px 10px;text-align:left'>Start Address</th>
+  <th style='padding:6px 10px;text-align:left'>End Address</th>
+  <th style='padding:6px 10px;text-align:right'>Size (MB)</th>
+  <th style='padding:6px 10px;text-align:right'>SystemRAM (MB)</th>
+  <th style='padding:6px 10px;text-align:right'>Carveout (MB)</th>
+</tr></thead>
+<tbody>
+{rows}
+</tbody>
+</table>
+</div>
+</div>"""
+
+
 def render_comparison_html(data: dict) -> str:
     # Detect standalone mode (self-comparison)
     is_standalone = (
@@ -1113,7 +1293,9 @@ def render_comparison_html(data: dict) -> str:
     summary_html = render_summary_table_html(data)
 
     if is_standalone:
-        # In standalone mode: memory breakdown + top processes, no delta table
+        # In standalone mode: memory breakdown + top processes, no delta table.
+        # Memory Layout is rendered as its own top-level section (see
+        # build_unified_html) rather than nested inside this summary.
         top_procs_html = _render_top_processes_html(data.get("summary_table", {}))
         smaps_html = render_top_processes_details_html(
             data.get("_smaps_cur", []), [], True)
@@ -1134,6 +1316,8 @@ def render_comparison_html(data: dict) -> str:
             f"<td>{trend}</td>"
             f"</tr>\n"
         )
+    # Memory Layout is rendered as its own top-level section (see
+    # build_unified_html) rather than nested inside this summary.
     return f"""
 <p><b>Current:</b> {data.get('current_label','')} &nbsp;|&nbsp;
    <b>Reference:</b> {data.get('reference_label','')}</p>
@@ -1535,6 +1719,26 @@ def build_unified_html(sections: list[tuple[str, str, dict]], title: str) -> str
 </div>
 """
 
+        # Memory Layout is rendered as its own top-level section (sibling of
+        # Memory Summary) rather than nested inside it, so it gets its own
+        # collapsible card with the same visual treatment.
+        if rtype == "snapshot_comparison":
+            layout_content = render_memory_layout_html(data.get("summary_table", {}))
+            if layout_content:
+                sec_id += 1
+                lsid = f"sec-{sec_id}"
+                body += f"""
+<div class='section-block'>
+  <div class='section-header' onclick="toggleSection('{lsid}')">
+    <span class='section-toggle' id='toggle-{lsid}'>\u2212</span>
+    <span class='section-title'>Memory Layout</span>
+  </div>
+  <div class='section-body' id='{lsid}'>
+    {layout_content}
+  </div>
+</div>
+"""
+
     # Unified Findings section (collapsed by default, after userspace_diff)
     findings_content = render_findings_html(sections)
     if findings_content:
@@ -1695,6 +1899,54 @@ def write_xlsx_unified(sections: list[tuple[str, str, dict]], output_path: str):
                            round(cat["current_kb"] / 1024, 2),
                            round(cat["delta_kb"] / 1024, 2),
                            cat["delta_pct"], cat["trend"]])
+
+            # MemoryLayout sheet -- physical address map (System RAM, kernel-static
+            # sub-regions, NHLOS carve-outs, and address gaps), mirroring the
+            # reference memmap_Parser.py "MemoryLayout" Excel sheet.
+            layout = data.get("summary_table", {}).get("current", {}).get("memory_layout", [])
+            if layout:
+                ws_layout = wb.create_sheet("MemoryLayout")
+                ws_layout.append(["Carveout Name", "Start address", "End address",
+                                   "Size (MB)", "SystemRAM Size (MB)", "Carveout Size (MB)"])
+                for cell in ws_layout[ws_layout.max_row]:
+                    cell.font = Font(bold=True)
+                sysram_fill   = PatternFill("solid", fgColor="C6EFCE")
+                kernel_fill   = PatternFill("solid", fgColor="D9D9F3")
+                reserved_fill = PatternFill("solid", fgColor="FFF2CC")
+                missing_fill  = PatternFill("solid", fgColor="FFC7CE")
+                REGION_FILLS = {
+                    "sysram":   sysram_fill,
+                    "kernel":   kernel_fill,
+                    "reserved": reserved_fill,
+                    "missing":  missing_fill,
+                }
+                total_size = total_sys = total_carv = 0.0
+                for name, start, end, size_mb, region_type in layout:
+                    is_sysram = (region_type == "sysram")
+                    # Everything that is not accessible System RAM counts as a
+                    # carve-out, including "Missing" unaccounted-gap rows (see
+                    # render_memory_layout_html for the full rationale).
+                    carveout_mb = size_mb if not is_sysram else 0
+                    sysram_mb = size_mb if is_sysram else 0
+                    total_size += size_mb
+                    total_sys += sysram_mb
+                    total_carv += carveout_mb
+                    ws_layout.append([name, hex(start), hex(end), size_mb, sysram_mb, carveout_mb])
+                    row = ws_layout.max_row
+                    fill = REGION_FILLS.get(region_type)
+                    if fill:
+                        for cell in ws_layout[row]:
+                            cell.fill = fill
+                            if region_type == "missing":
+                                cell.font = Font(color="CC0000", bold=True)
+                ws_layout.append(["Total", "", "", round(total_size, 2),
+                                   round(total_sys, 2), round(total_carv, 2)])
+                for cell in ws_layout[ws_layout.max_row]:
+                    cell.font = Font(bold=True)
+                for col_letter in ("A", "B", "C"):
+                    ws_layout.column_dimensions[col_letter].width = 20
+                for col_letter in ("D", "E", "F"):
+                    ws_layout.column_dimensions[col_letter].width = 16
 
         elif rtype == "kernel_diff":
             ws.append(["Slab", "Ref KB", "Cur KB", "Delta KB", "Delta %", "Flagged"])

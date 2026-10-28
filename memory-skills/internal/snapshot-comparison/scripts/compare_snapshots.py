@@ -104,6 +104,311 @@ CATEGORIES = [
 ]
 
 
+def _classify_sub_region(name: str) -> str:
+    """
+    Classify a named sub-region (either a depth>0 /proc/iomem entry nested
+    inside a System RAM block, or a depth-0 non-"System RAM" entry that
+    falls within the physical RAM address range) into one of two distinct
+    UI-filterable categories:
+      - "kernel":   actual kernel code/data sections (e.g. "Kernel code",
+                    "Kernel data") -- static kernel image footprint.
+      - "reserved": generic anonymous "reserved" carve-outs that the kernel
+                    doesn't attribute to any specific subsystem (these sit
+                    between DDR sub-blocks and are distinct from named NHLOS
+                    device-tree carve-outs).
+    """
+    lname = name.lower()
+    if lname.startswith("kernel"):
+        return "kernel"
+    return "reserved"
+
+
+# Gaps larger than this are treated as non-populated address space between
+# separate DRAM banks/channels rather than unaccounted ("Missing") memory.
+GAP_THRESHOLD_MB = 1024.0
+_DRAM_BANK_SPLIT_BYTES = int(GAP_THRESHOLD_MB) * 1024 * 1024
+
+
+def derive_dram_banks(memblock_regions: list, iomem_regions: list,
+                      reserved_regions: list | None = None) -> list:
+    """
+    Determine the physical DRAM bank address ranges for the board.
+
+    /proc/iomem describes the *entire* SoC physical address space -- DRAM,
+    peripheral MMIO register windows, and (critically) large PCIe BAR/ECAM
+    apertures that can be hundreds of MB or several GB wide. Those apertures
+    are address space, not memory, so they must never be folded into the
+    physical memory map.
+
+    The authoritative list of populated DRAM is memblock's "memory" list
+    (/sys/kernel/debug/memblock/memory), so prefer it. Fall back to the
+    extents of /proc/iomem's depth-0 "System RAM" entries when memblock is
+    unavailable (e.g. debugfs not mounted).
+
+    IMPORTANT: memblock's "memory" list only contains regions the kernel's
+    page allocator actually knows about. Device-tree reserved-memory nodes
+    marked "no-map" (e.g. the TrustZone "hyp" region, often the very first
+    carve-out at the bottom of DRAM, such as hyp@0x80000000) are deliberately
+    kept OUT of memblock because the kernel must never touch them -- but they
+    are still physically part of DRAM. Without folding their address ranges
+    into the bank spans below, the lowest "no-map" carve-outs would fall
+    outside every derived bank and get silently dropped by _in_dram(),
+    making the reported Memory Layout appear to start several hundred KB/MB
+    above the board's true DRAM base (e.g. 0x80700000 instead of 0x80000000).
+    To avoid this, the reserved-memory node spans are merged in alongside
+    the memblock/iomem spans before bank boundaries are computed.
+
+    Returns a list of [start, end) byte ranges, each one contiguous DRAM
+    bank, sorted by start address.
+    """
+    spans: list = []
+    for r in memblock_regions or []:
+        try:
+            base = r.get("base")
+            base_int = int(base, 16) if isinstance(base, str) else int(base)
+            size_bytes = int(r.get("size_kb", 0)) * 1024
+        except (TypeError, ValueError):
+            continue
+        if size_bytes > 0:
+            spans.append((base_int, base_int + size_bytes))
+
+    if not spans:
+        # Fallback: use the System RAM entries that /proc/iomem reports.
+        for r in iomem_regions or []:
+            if r.get("depth", 0) == 0 and r.get("name") == "System RAM":
+                spans.append((r["start"], r["end"] + 1))
+
+    # Fold in device-tree reserved-memory carve-outs (including "no-map"
+    # regions that memblock never sees) so they anchor/extend the DRAM bank
+    # boundaries instead of being excluded from them.
+    for r in reserved_regions or []:
+        try:
+            base = r.get("base")
+            base_int = int(base, 16) if isinstance(base, str) else int(base)
+            size_bytes = int(r.get("size_kb", 0)) * 1024
+        except (TypeError, ValueError):
+            continue
+        if size_bytes > 0:
+            spans.append((base_int, base_int + size_bytes))
+
+    if not spans:
+        return []
+
+    spans.sort()
+    banks: list = []
+    for start, end in spans:
+        # Merge into the current bank when the hole before it is small enough
+        # to be an intra-bank carve-out rather than a separate DRAM interface.
+        if banks and start - banks[-1][1] <= _DRAM_BANK_SPLIT_BYTES:
+            banks[-1][1] = max(banks[-1][1], end)
+        else:
+            banks.append([start, end])
+    return banks
+
+
+def build_memory_layout(iomem_regions: list, reserved_regions: list,
+                        memblock_regions: list | None = None) -> list:
+    """
+    Build the physical memory layout (System RAM blocks, kernel code/data
+    sections, generic reserved sub-regions from /proc/iomem, and NHLOS
+    carve-outs from device-tree reserved-memory nodes), filling address
+    gaps with "Missing" entries.
+
+    Every emitted row is constrained to lie inside a real DRAM bank (see
+    derive_dram_banks), so the layout's Total reflects the board's physical
+    RAM and never includes PCIe/MMIO address-space apertures.
+
+    Returns list of (name, start, end, size_mb, region_type) tuples sorted
+    by start address. region_type is one of:
+      sysram, kernel, reserved, nhlos, missing.
+    These five types map 1:1 to the five filterable categories shown in
+    the unified report's "Memory Layout" section.
+    """
+    layout: list = []
+
+    dram_banks = derive_dram_banks(memblock_regions or [], iomem_regions,
+                                   reserved_regions)
+
+    def _in_dram(start: int, end: int) -> bool:
+        """True when [start, end) lies wholly inside a single DRAM bank."""
+        if not dram_banks:
+            return True
+        return any(start >= b[0] and end <= b[1] for b in dram_banks)
+
+    # Running set of address ranges already represented by a row. Every row is
+    # emitted through _add() so no byte of physical memory is ever counted
+    # twice, regardless of how many kernel sources describe the same range.
+    _covered: list = []
+
+    def _uncovered(start: int, end: int) -> list:
+        """Return [start, end) minus every range already emitted."""
+        gaps = [(start, end)]
+        for cs, ce in _covered:
+            if not gaps:
+                break
+            nxt = []
+            for gs, ge in gaps:
+                if ce <= gs or cs >= ge:
+                    nxt.append((gs, ge))
+                    continue
+                if cs > gs:
+                    nxt.append((gs, min(cs, ge)))
+                if ce < ge:
+                    nxt.append((max(ce, gs), ge))
+            gaps = nxt
+        return gaps
+
+    def _add(name: str, start: int, end: int, region_type: str,
+             require_dram: bool = True) -> None:
+        """Emit rows for the not-yet-covered parts of [start, end)."""
+        if end <= start:
+            return
+        if require_dram and not _in_dram(start, end):
+            return
+        for gs, ge in _uncovered(start, end):
+            # Decide on the RAW byte span, not the MB-rounded display value.
+            # A sub-MB range (as small as a single 4 KB page) rounds to
+            # "0.00" MB -- testing `size_mb <= 0` on that rounded value
+            # silently discards a genuinely nonzero range of physical
+            # memory, making it vanish from the layout entirely (not even
+            # emitted as a 0.00 MB row) with no corresponding reduction in
+            # the reported Total RAM. Comparing the unrounded byte span
+            # instead ensures every real range is represented.
+            if ge <= gs:
+                continue
+            size_mb = round((ge - gs) / 1024 / 1024, 2)
+            layout.append((name, gs, ge, size_mb, region_type))
+            _covered.append((gs, ge))
+        _covered.sort()
+
+    # depth > 0 iomem entries are sub-regions reserved *within* a System RAM
+    # block (e.g. "Kernel code", "Kernel data", generic "reserved", etc.)
+    sub_entries = [
+        (r["name"], r["start"], r["end"] + 1,
+         round((r["end"] - r["start"] + 1) / 1024 / 1024, 2))
+        for r in iomem_regions if r.get("depth", 0) > 0
+    ]
+
+    for r in iomem_regions:
+        if r.get("name") != "System RAM" or r.get("depth", 0) != 0:
+            continue
+        block_start = r["start"]
+        block_end   = r["end"] + 1
+        if not _in_dram(block_start, block_end):
+            continue
+
+        block_subs = sorted(
+            [(n, s, e, mb) for n, s, e, mb in sub_entries
+             if s >= block_start and e <= block_end],
+            key=lambda x: x[1],
+        )
+
+        if not block_subs:
+            _add("System RAM", block_start, block_end, "sysram")
+        else:
+            prev = block_start
+            for name, s, e, mb in block_subs:
+                if s > prev:
+                    _add("System RAM", prev, s, "sysram")
+                _add(name, s, e, _classify_sub_region(name))
+                prev = e
+            if prev < block_end:
+                _add("System RAM", prev, block_end, "sysram")
+
+    # NHLOS carve-outs from device-tree reserved-memory nodes. These normally
+    # sit *outside* the System RAM blocks (the kernel never sees them), but a
+    # node that does overlap an already-emitted range contributes only its
+    # uncovered remainder so the total cannot be inflated.
+    for r in reserved_regions:
+        base = r.get("base")
+        try:
+            base_int = int(base, 16) if isinstance(base, str) else int(base)
+        except (TypeError, ValueError):
+            continue
+        size_kb = r.get("size_kb", 0)
+        size_bytes = size_kb * 1024
+        if size_bytes <= 0:
+            continue
+        # A carve-out described in the device tree but not backed by a
+        # populated DRAM bank is not part of this board's memory map.
+        _add(r.get("name", "?").split("@")[0], base_int, base_int + size_bytes,
+             "nhlos")
+
+    if not layout:
+        return layout
+
+    # Depth-0 iomem entries that are NOT "System RAM" (typically named
+    # "reserved") but that fall inside a populated DRAM bank are real
+    # carve-outs living between System RAM blocks (e.g.
+    # "acb00000-acffffff : reserved" between two DDR sub-regions). These
+    # are added as "kernel"/"reserved" entries (classified the same way as
+    # depth>0 sub-entries) so the physical map reflects what the kernel
+    # actually reports for that range instead of treating it as an unnamed
+    # "Missing" gap.
+    #
+    # Everything NOT inside a DRAM bank is address space rather than
+    # memory -- peripheral MMIO register blocks (clock controllers,
+    # I2C/SPI/UART, GIC, pinctrl, ...) and, most importantly, the large
+    # PCIe BAR/ECAM apertures which can be 512 MB-1 GB+ each. Including
+    # those would inflate the layout Total well past the board's physical
+    # RAM, so they are excluded entirely by _in_dram().
+    #
+    # Critically, the kernel reports most device-tree carve-outs *twice*:
+    # once as an anonymous depth-0 "reserved" range in /proc/iomem and
+    # again as a named node under /sys/.../reserved-memory (already added
+    # above as "nhlos"). Emitting both would double-count that memory and
+    # push the layout Total above the board's real RAM size. The named
+    # NHLOS row is the more informative of the two, so _add() contributes
+    # only the portions of each anonymous range that are not already covered.
+    for r in iomem_regions:
+        if r.get("depth", 0) != 0 or r.get("name") == "System RAM":
+            continue
+        name = r.get("name", "reserved")
+        _add(name, r["start"], r["end"] + 1, _classify_sub_region(name))
+
+    layout.sort(key=lambda x: x[1])
+
+    # Address gaps between adjacent regions are only meaningful ("missing" /
+    # unaccounted memory) when they are small -- comparable in size to a
+    # single carve-out. Many Qualcomm SoCs place a second DDR bank/channel
+    # at a much higher physical address (e.g. 0xA_00000000), tens of GB
+    # away from the first bank. The resulting address-space "hole" between
+    # the two banks is NOT missing/unaccounted memory -- it's simply
+    # non-populated address space between separate DRAM interfaces, so it
+    # must not be reported as a "Missing" carve-out row (which would both
+    # alarm the reader and, if summed, wildly inflate the layout's total).
+    #
+    # Heuristic: drop any gap larger than GAP_THRESHOLD_MB (module-level
+    # constant). Real unaccounted carve-outs on these platforms are at most
+    # tens/low-hundreds of MB; inter-bank/channel holes are multiple GB, so
+    # a 1024 MB (1 GB) cutoff cleanly separates the two cases without
+    # needing SoC-specific tables. A gap that spans two different DRAM
+    # banks is never reported regardless of size.
+    filled: list = []
+    prev_end = layout[0][1]
+    for entry in layout:
+        name, start, end, size_mb, region_type = entry
+        if start > prev_end:
+            # Compare the RAW byte gap against the threshold, not the
+            # MB-rounded value. A gap under ~5 KB rounds to "0.00" MB and
+            # fails `0 < gap_mb`, which silently drops a genuinely
+            # unaccounted range of physical memory from the layout instead
+            # of reporting it as a (small) "Missing" row -- the exact kind
+            # of sub-pixel gap this fallback exists to catch.
+            gap_bytes = start - prev_end
+            gap_mb = round(gap_bytes / 1024 / 1024, 2)
+            if gap_bytes <= _DRAM_BANK_SPLIT_BYTES and _in_dram(prev_end, start):
+                filled.append(("Missing", prev_end, start, gap_mb, "missing"))
+            # gaps > GAP_THRESHOLD_MB, or gaps that are not backed by a
+            # populated DRAM bank, are non-populated address space --
+            # silently skipped (not part of the physical memory map).
+        filled.append(entry)
+        if end > prev_end:
+            prev_end = end
+
+    return filled
+
+
 def compute_summary_table(snap: dict) -> dict:
     """
     Compute the hierarchical memory summary table from a snapshot.
@@ -350,6 +655,22 @@ def compute_summary_table(snap: dict) -> dict:
             key=lambda x: x["pss_kb"], reverse=True
         )[:15]
 
+    # Physical Memory Layout (System RAM blocks, kernel-reserved sub-regions,
+    # and NHLOS carve-outs) -- from /proc/iomem regions and device-tree
+    # reserved-memory nodes, mirroring the reference memmap_Parser.py MemoryLayout sheet.
+    # memblock's "memory" list is the authoritative set of populated DRAM
+    # banks and is used to exclude PCIe/MMIO address-space apertures from
+    # the physical memory map (see derive_dram_banks).
+    memory_layout = []
+    iomem_regions = iomem.get("parsed", {}).get("regions", []) if iomem.get("available") else []
+    reserved_nodes = rm.get("nodes", []) if rm.get("available") else []
+    memblock_src = snap.get("sources", {}).get("memblock", {})
+    memblock_regions = (memblock_src.get("parsed", {}) or {}).get("regions", []) \
+        if memblock_src.get("available") else []
+    if iomem_regions and reserved_nodes:
+        memory_layout = build_memory_layout(iomem_regions, reserved_nodes,
+                                            memblock_regions)
+
     return {
         "total_ram_kb":                total_ram_kb,
         "system_ram_kb":               system_ram_kb,
@@ -370,6 +691,7 @@ def compute_summary_table(snap: dict) -> dict:
             "Buffers":  parsed.get("Buffers", 0),
         },
         "top_processes":               top_processes,
+        "memory_layout":               memory_layout,
     }
 
 
