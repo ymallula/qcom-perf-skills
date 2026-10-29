@@ -82,6 +82,7 @@ COMPARE_SNAPSHOTS = INTERNAL / "snapshot-comparison" / "scripts" / "compare_snap
 KERNEL_DIFF       = INTERNAL / "kernel-diff"          / "scripts" / "analyze_kernel_diff.py"
 USERSPACE_DIFF    = INTERNAL / "userspace-diff"       / "scripts" / "analyze_userspace_diff.py"
 GENERATE_REPORT   = INTERNAL / "report-generation"    / "scripts" / "generate_report.py"
+IPCAT_LAYOUT      = INTERNAL / "ipcat-memory-layout"  / "scripts" / "ipcat_layout.py"
 
 PRESETS_FILE = SKILLS / "memory-analysis" / "usecases" / "presets.json"
 
@@ -192,6 +193,31 @@ def move_intermediates(reports_dir: Path) -> None:
     intermediate_dir.mkdir(exist_ok=True)
     for json_file in reports_dir.glob("*.json"):
         json_file.rename(intermediate_dir / json_file.name)
+
+
+def maybe_run_ipcat_layout(args, reports_dir: Path) -> str | None:
+    """
+    If --ipcat-regions was provided, run internal/ipcat-memory-layout against
+    the snapshot_comparison_report.json just produced in reports_dir (which
+    contains the device's collected physical memory_layout) and return the
+    path to the generated ipcat_layout_report.json, or None if not requested
+    or the comparison report isn't available yet.
+    """
+    if not getattr(args, "ipcat_regions", None):
+        return None
+    target = reports_dir / "snapshot_comparison_report.json"
+    if not target.is_file():
+        print(f"{TAG} WARNING: --ipcat-regions given but {target} not found -- skipping IPCat comparison")
+        return None
+    cmd = [sys.executable, str(IPCAT_LAYOUT),
+           "--ipcat",      args.ipcat_regions,
+           "--target",     str(target),
+           "--output-dir", str(reports_dir)]
+    if getattr(args, "ipcat_chip", ""):
+        cmd += ["--chip", args.ipcat_chip]
+    run(cmd, "Comparing device memory layout against IP Catalog")
+    out = reports_dir / "ipcat_layout_report.json"
+    return str(out) if out.is_file() else None
 
 
 # ---------------------------------------------------------------------------
@@ -332,9 +358,15 @@ def mode_snapshot(args, output_dir: Path) -> Path:
          "--format",     "json"],
         "Running snapshot analysis")
 
+    # Optional IPCat Memory Layout comparison
+    report_inputs = [os.path.join(reports, "snapshot_comparison_report.json")]
+    ipcat_report = maybe_run_ipcat_layout(args, reports_dir)
+    if ipcat_report:
+        report_inputs.append(ipcat_report)
+
     # Generate report
     run([sys.executable, str(GENERATE_REPORT),
-         "--input",              os.path.join(reports, "snapshot_comparison_report.json"),
+         "--input",              *report_inputs,
          "--format",             "html",
          "--unified",
          "--title",              title,
@@ -467,12 +499,19 @@ def mode_workload(args, output_dir: Path) -> Path:
          "--format",         "json"],
         "Running userspace memory diff")
 
+    # Optional IPCat Memory Layout comparison
+    report_inputs = [
+        os.path.join(reports, "snapshot_comparison_report.json"),
+        os.path.join(reports, "kernel_diff_report.json"),
+        os.path.join(reports, "userspace_diff_report.json"),
+    ]
+    ipcat_report = maybe_run_ipcat_layout(args, reports_dir)
+    if ipcat_report:
+        report_inputs.append(ipcat_report)
+
     # Generate report
     run([sys.executable, str(GENERATE_REPORT),
-         "--input",
-             os.path.join(reports, "snapshot_comparison_report.json"),
-             os.path.join(reports, "kernel_diff_report.json"),
-             os.path.join(reports, "userspace_diff_report.json"),
+         "--input",              *report_inputs,
          "--format",             "html",
          "--unified",
          "--title",              title,
@@ -544,12 +583,19 @@ def mode_regression(args, output_dir: Path) -> Path:
          "--format",         "json"],
         "Running userspace memory diff")
 
+    # Optional IPCat Memory Layout comparison
+    report_inputs = [
+        os.path.join(reports, "snapshot_comparison_report.json"),
+        os.path.join(reports, "kernel_diff_report.json"),
+        os.path.join(reports, "userspace_diff_report.json"),
+    ]
+    ipcat_report = maybe_run_ipcat_layout(args, reports_dir)
+    if ipcat_report:
+        report_inputs.append(ipcat_report)
+
     # Generate report
     run([sys.executable, str(GENERATE_REPORT),
-         "--input",
-             os.path.join(reports, "snapshot_comparison_report.json"),
-             os.path.join(reports, "kernel_diff_report.json"),
-             os.path.join(reports, "userspace_diff_report.json"),
+         "--input",              *report_inputs,
          "--format",             "html",
          "--unified",
          "--title",              title,
@@ -620,12 +666,19 @@ def mode_comparison(args, output_dir: Path) -> Path:
          "--format",         "json"],
         "Running userspace memory diff")
 
+    # Optional IPCat Memory Layout comparison
+    report_inputs = [
+        os.path.join(reports, "snapshot_comparison_report.json"),
+        os.path.join(reports, "kernel_diff_report.json"),
+        os.path.join(reports, "userspace_diff_report.json"),
+    ]
+    ipcat_report = maybe_run_ipcat_layout(args, reports_dir)
+    if ipcat_report:
+        report_inputs.append(ipcat_report)
+
     # Generate report
     run([sys.executable, str(GENERATE_REPORT),
-         "--input",
-             os.path.join(reports, "snapshot_comparison_report.json"),
-             os.path.join(reports, "kernel_diff_report.json"),
-             os.path.join(reports, "userspace_diff_report.json"),
+         "--input",              *report_inputs,
          "--format",             "html",
          "--unified",
          "--title",              title,
@@ -771,12 +824,19 @@ def mode_user_launched_interactive(args, output_dir: Path) -> Path:
          "--format",         "json"],
         "Running userspace memory diff")
 
+    # Optional IPCat Memory Layout comparison
+    report_inputs = [
+        os.path.join(reports, "snapshot_comparison_report.json"),
+        os.path.join(reports, "kernel_diff_report.json"),
+        os.path.join(reports, "userspace_diff_report.json"),
+    ]
+    ipcat_report = maybe_run_ipcat_layout(args, reports_dir)
+    if ipcat_report:
+        report_inputs.append(ipcat_report)
+
     # Generate report
     run([sys.executable, str(GENERATE_REPORT),
-         "--input",
-             os.path.join(reports, "snapshot_comparison_report.json"),
-             os.path.join(reports, "kernel_diff_report.json"),
-             os.path.join(reports, "userspace_diff_report.json"),
+         "--input",              *report_inputs,
          "--format",             "html",
          "--unified",
          "--title",              title,
@@ -849,12 +909,19 @@ def mode_user_launched_compare(args, output_dir: Path) -> Path:
          "--format",         "json"],
         "Running userspace memory diff")
 
+    # Optional IPCat Memory Layout comparison
+    report_inputs = [
+        os.path.join(reports, "snapshot_comparison_report.json"),
+        os.path.join(reports, "kernel_diff_report.json"),
+        os.path.join(reports, "userspace_diff_report.json"),
+    ]
+    ipcat_report = maybe_run_ipcat_layout(args, reports_dir)
+    if ipcat_report:
+        report_inputs.append(ipcat_report)
+
     # Generate report
     run([sys.executable, str(GENERATE_REPORT),
-         "--input",
-             os.path.join(reports, "snapshot_comparison_report.json"),
-             os.path.join(reports, "kernel_diff_report.json"),
-             os.path.join(reports, "userspace_diff_report.json"),
+         "--input",              *report_inputs,
          "--format",             "html",
          "--unified",
          "--title",              title,
@@ -955,6 +1022,22 @@ def main() -> int:
     parser.add_argument(
         "--password", default=None,
         help="SSH password (if not provided, prompted interactively)"
+    )
+
+    # --- IPCat Memory Layout comparison (all modes that produce a snapshot_comparison_report.json) ---
+    parser.add_argument(
+        "--ipcat-regions", default=None, metavar="PATH",
+        help=(
+            "Path to a normalized IPCat region JSON (agent-fetched via the "
+            "ipcat-mcp-server MCP server -- see internal/ipcat-memory-layout/README.md). "
+            "When provided, an additional 'IPCat Memory Layout' table comparing the "
+            "device's collected physical memory layout against the IP Catalog reference "
+            "is added to the generated report."
+        )
+    )
+    parser.add_argument(
+        "--ipcat-chip", default="", metavar="CHIP",
+        help="IP Catalog chip id/alias used to fetch --ipcat-regions (for report display only)"
     )
 
     # --- Output parameters (all modes) ---

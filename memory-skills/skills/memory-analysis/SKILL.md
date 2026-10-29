@@ -10,19 +10,24 @@ description: >
   (3) Regression: compare a live device against a pre-collected reference snapshot;
   (4) Comparison: compare two pre-collected snapshots offline (no device needed).
   Generates a unified HTML report with memory breakdown, process ranking,
-  kernel/userspace diffs, and root cause analysis.
+  kernel/userspace diffs, and root cause analysis. All modes optionally accept
+  --ipcat-regions to add an "IPCat Memory Layout" table comparing the device's
+  collected physical memory layout against the IP Catalog (IPCat) reference
+  memory map for the matching chip, fetched by the AI agent via the
+  ipcat-mcp-server MCP server.
 license: BSD 3-Clause License
 compatibility: >
   Requires Python 3.10+. pip install -r requirements.txt.
   ADB transport: adb in PATH, Qualcomm Linux device with adbd enabled.
   SSH transport: pip install paramiko, any Linux device reachable over network.
   Host OS: Windows or Linux.
+  IPCat comparison (optional): access to the ipcat-mcp-server MCP server.
 metadata:
   author: "Jagadeesh Pagadala"
   version: "0.0.1"
   platform: "Qualcomm Linux"
   category: "Memory Analysis"
-  internal-dependencies: "data-collection,snapshot-comparison,kernel-diff,userspace-diff,anomaly-rca,report-generation"
+  internal-dependencies: "data-collection,snapshot-comparison,kernel-diff,userspace-diff,anomaly-rca,report-generation,ipcat-memory-layout"
   entry-point: "skills/memory-analysis/scripts/run.py"
   presets: "skills/memory-analysis/usecases/presets.json"
 ---
@@ -370,6 +375,8 @@ python skills/memory-analysis/scripts/run.py \
 | `--output-dir` | all | No | `results/<mode>_<ts>/` | Output directory (use same dir for 2C collect steps) |
 | `--label` | 1,3,2C | No | `snapshot` | Label for the collected snapshot (use `baseline` or `active` for 2C) |
 | `--title` | 3,4,2C | No | auto | Report title |
+| `--ipcat-regions` | all | No | -- | Path to a normalized IPCat region JSON (agent-fetched via `ipcat-mcp-server`). Adds an "IPCat Memory Layout" table to the report. |
+| `--ipcat-chip` | all | No | -- | IP Catalog chip id/alias used for `--ipcat-regions` (display only) |
 
 *Either `--workload` or `--command` required for Mode 2A/2B.
 **Required when using `--command`.
@@ -389,6 +396,7 @@ python skills/memory-analysis/scripts/run.py \
 | `active/snapshot.json` | 2A,2B,2C | Active workload snapshot |
 | `snapshot/snapshot.json` | 1,3 | Collected device snapshot |
 | `reports/_intermediate/` | all | Intermediate JSON reports (for debugging) |
+| `reports/_intermediate/ipcat_layout_report.json` | all, when `--ipcat-regions` given | IPCat vs device memory layout comparison data |
 
 ---
 
@@ -464,6 +472,40 @@ PCIe windows.
 
 It is also written to a dedicated `MemoryLayout` sheet in the unified XLSX
 report (when `--format xlsx` is used).
+
+### IPCat Memory Layout section (optional)
+
+When `--ipcat-regions <path>` is supplied, the report includes an additional
+top-level **"IPCat Memory Layout"** section comparing the device's collected
+physical memory layout ("Target") against the IP Catalog (IPCat) reference
+memory map for the matching chip. Columns shown:
+
+```
+Region | IPCat Start Address | IPCat End Address | IPCat Size (MB)
+       | Target Start Address | Target End Address | Target Size (MB) | Matching
+```
+
+`Matching` is `Yes` (green) when a region's start address, end address, and
+size all agree within a small tolerance between IPCat and the device, and
+`No` (red) otherwise — including regions present in only one of the two
+sources.
+
+**How to produce `--ipcat-regions`:** MCP tools can only be called from the
+AI agent session, not from this script. So the agent must:
+1. Resolve the IPCat chip for the device (e.g. from `device.soc_name` in
+   `snapshot.json`, using `chips_get_latest_chip` / `chips_list_chips` via
+   the `ipcat-mcp-server` MCP server) — **or** ask the user which device(s)
+   to compare against if the chip cannot be determined automatically.
+2. Fetch the chip's reference memory map
+   (`memory_map_get_memory_map_regions`, or similar) and save it as a
+   normalized JSON file (see
+   `internal/ipcat-memory-layout/README.md` for the exact schema and field
+   aliases accepted).
+3. Pass that file via `--ipcat-regions <path>` (and optionally
+   `--ipcat-chip <chip_id>` for display) to `run.py` for any mode.
+
+See `internal/ipcat-memory-layout/README.md` for full details of the MCP
+workflow, supported field names, and matching tolerance rules.
 
 ---
 

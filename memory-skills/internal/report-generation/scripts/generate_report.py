@@ -30,6 +30,7 @@ REPORT_TYPE_MAP = {
     "KernelDiffReport":           "kernel_diff",
     "UserspaceDiffReport":        "userspace_diff",
     "RCAReport":                  "rca",
+    "IPCatLayoutReport":          "ipcat_layout",
 }
 
 def detect_report_type(data: dict) -> str:
@@ -42,6 +43,8 @@ def detect_report_type(data: dict) -> str:
         return "rca"
     if "results" in data and "carveout_source" in data:
         return "carveout_validation"
+    if "rows" in data and "ipcat_source" in data:
+        return "ipcat_layout"
     if "categories" in data and "top_growers" in data:
         return "snapshot_comparison"
     if "slab_diff" in data and "buddy_fragmentation" in data:
@@ -280,6 +283,73 @@ function filterMemoryLayout(tableId) {
   setTxt(tableId + '-total-carveout', tCarv);
   var cnt = document.getElementById(tableId + '-shown-count');
   if (cnt) cnt.textContent = shown;
+}
+function filterIpcatLayout(tableId) {
+  var table = document.getElementById(tableId);
+  if (!table) return;
+  var checked = Array.prototype.slice.call(
+    document.querySelectorAll("input.ipcatlayout-filter[data-table='" + tableId + "']:checked")
+  ).map(function(cb) { return cb.value; });
+  var rows = table.querySelectorAll('tr.ipcatlayout-row');
+  var shown = 0;
+  rows.forEach(function(row) {
+    var show = checked.length === 0 || checked.indexOf(row.getAttribute('data-matching')) !== -1;
+    row.style.display = show ? '' : 'none';
+    if (show) shown++;
+  });
+  var cnt = document.getElementById(tableId + '-shown-count');
+  if (cnt) cnt.textContent = shown;
+  refreshIpcatMerge(tableId);
+}
+// Dynamically recompute the IPCat-side rowspan merge for the "IPCat Memory
+// Layout" table based on which rows are CURRENTLY VISIBLE (i.e. after the
+// Matching/Mismatching filter has hidden some rows). This replaces a
+// static server-rendered rowspan (which would desync -- and visibly break
+// the table's column alignment -- as soon as the filter hid the one row
+// that happened to be carrying the spanned <td> cells while a later row
+// in the same merge-group remained visible).
+//
+// Every row in the table always renders its OWN full, independent set of
+// four IPCat-side <td class='ipcat-cell'> cells (never omitted at render
+// time) tagged with a shared data-group id. This function, run once on
+// initial page load and again after every filter change, does the
+// merging purely in the DOM:
+//   1. Group rows by data-group (preserving document order).
+//   2. Within each group, find the rows currently visible.
+//   3. Show the ipcat-cell <td>s only on the FIRST visible row of the
+//      group, setting that row's cells' rowSpan to the visible count.
+//   4. Hide (display:none) the ipcat-cell <td>s on every other visible
+//      row in the group -- the browser's native rowspan handling from
+//      step 3 correctly fills those cells' column slots, so the table
+//      never loses its column alignment regardless of which rows the
+//      filter has hidden.
+function refreshIpcatMerge(tableId) {
+  var table = document.getElementById(tableId);
+  if (!table) return;
+  var rows = Array.prototype.slice.call(table.querySelectorAll('tr.ipcatlayout-row'));
+  var groups = {};
+  var order = [];
+  rows.forEach(function(row) {
+    var g = row.getAttribute('data-group');
+    if (!(g in groups)) { groups[g] = []; order.push(g); }
+    groups[g].push(row);
+  });
+  order.forEach(function(g) {
+    var groupRows = groups[g];
+    // Reset every row's ipcat-cells to a known baseline first.
+    groupRows.forEach(function(row) {
+      var cells = row.querySelectorAll('td.ipcat-cell');
+      cells.forEach(function(td) { td.rowSpan = 1; td.style.display = 'none'; });
+    });
+    var visible = groupRows.filter(function(row) { return row.style.display !== 'none'; });
+    if (visible.length === 0) return;
+    var first = visible[0];
+    var firstCells = first.querySelectorAll('td.ipcat-cell');
+    firstCells.forEach(function(td) {
+      td.style.display = '';
+      td.rowSpan = visible.length;
+    });
+  });
 }
 </script>
 """
@@ -1282,6 +1352,198 @@ def render_memory_layout_html(st: dict) -> str:
 </div>"""
 
 
+def render_ipcat_layout_html(data: dict) -> str:
+    """
+    Render the "IPCat Memory Layout" table -- a comparison of the device's
+    collected physical memory layout ("Target") against the IP Catalog
+    (IPCat) reference memory map for the matching chip, as produced by
+    internal/ipcat-memory-layout/scripts/ipcat_layout.py.
+
+    Columns: IPCat Region, IPCat Start Address, IPCat End Address,
+             IPCat Size (MB), Target Region, Target Start Address,
+             Target End Address, Target Size (MB), Matching.
+    """
+    rows_data = data.get("rows", [])
+    if not rows_data:
+        return "<p style='color:#888'>No IPCat layout data available.</p>"
+
+    def _addr(v):
+        return hex(v) if isinstance(v, int) else (v if v else "--")
+
+    def _size(v):
+        return f"{v:.2f}" if isinstance(v, (int, float)) else "--"
+
+    def _name(v):
+        return v if v else "--"
+
+    # Per user requirement: when multiple consecutive output rows share the
+    # same IPCat region (identical name + start + end -- e.g. several
+    # Target sub-regions tiling across one IPCat region such as "UEFI"),
+    # the IPCat-side columns are merged into a single rowspan'd cell group
+    # instead of repeating the same IPCat name/start/end/size on every row.
+    # The Target-side columns (and the Matching column, which reflects each
+    # individual Target overlap) are NEVER merged -- every Target overlap
+    # still gets its own full row.
+    def _ipcat_key(r):
+        return (r.get("region"), r.get("ipcat_start"), r.get("ipcat_end"))
+
+    # First pass: compute consecutive run-length for each row's IPCat key.
+    run_start_idx: list[int] = [0] * len(rows_data)
+    i = 0
+    while i < len(rows_data):
+        j = i
+        while j + 1 < len(rows_data) and _ipcat_key(rows_data[j + 1]) == _ipcat_key(rows_data[i]):
+            j += 1
+        for k in range(i, j + 1):
+            run_start_idx[k] = i
+        i = j + 1
+
+    table_id = "ipcat-layout-tbl"
+
+    # Per user requirement, the IPCat-side merge-via-rowspan must NOT break
+    # the table when rows are hidden by the Matching/Mismatching filter.
+    # Static Python-rendered rowspan breaks as soon as the row carrying the
+    # spanned <td> gets hidden (display:none) while a later row in the same
+    # group remains visible -- the browser has no cell to fill that slot in
+    # the visible row, misaligning every column to its right.
+    #
+    # Fix: every row ALWAYS renders its own full, independent set of IPCat
+    # <td> cells (tagged with class 'ipcat-cell' and a shared 'data-group'
+    # id per merge-group). A JS helper (refreshIpcatMerge(), see CSS/script
+    # block) then dynamically shows the IPCat cells only on the first
+    # *currently visible* row of each group (setting that row's cells'
+    # rowspan to the number of visible rows in the group) and hides the
+    # IPCat cells (not the whole <tr>) on the rest. This routine re-runs
+    # after every filter change, so the merge always reflects exactly what
+    # is visible -- the table structure can never desync from the filter.
+    rows_html = ""
+    idx = 0
+    while idx < len(rows_data):
+        run_first = run_start_idx[idx]
+        # Count how many rows share this IPCat key starting at run_first.
+        run_len = 1
+        while run_first + run_len < len(rows_data) and run_start_idx[run_first + run_len] == run_first:
+            run_len += 1
+
+        # A merge-group with more than one row is always styled red on the
+        # IPCat side (splitting proves no single carve-out cleanly matches
+        # the full IPCat region), regardless of any individual tile's own
+        # Matching value. A non-split (group size 1) row uses that row's
+        # own Matching-based color as before.
+        ipcat_bg = "background:#fde8e8;" if run_len > 1 else ""
+
+        for offset in range(run_len):
+            r = rows_data[run_first + offset]
+            matching = r.get("matching", "No")
+            row_style = "background:#e8f8e8" if matching == "Yes" else "background:#fde8e8"
+            badge_color = "#155724" if matching == "Yes" else "#721c24"
+            badge_bg = "#d4edda" if matching == "Yes" else "#f8d7da"
+
+            row_ipcat_bg = (
+                ipcat_bg if run_len > 1
+                else ("background:#e8f8e8;" if matching == "Yes" else "background:#fde8e8;")
+            )
+
+            ipcat_cells = (
+                f"<td class='ipcat-cell' style='padding:5px 10px;text-align:center;vertical-align:middle;{row_ipcat_bg}'>{_name(r.get('region'))}</td>"
+                f"<td class='ipcat-cell' style='padding:5px 10px;font-family:monospace;font-size:12px;text-align:center;vertical-align:middle;{row_ipcat_bg}'>{_addr(r.get('ipcat_start'))}</td>"
+                f"<td class='ipcat-cell' style='padding:5px 10px;font-family:monospace;font-size:12px;text-align:center;vertical-align:middle;{row_ipcat_bg}'>{_addr(r.get('ipcat_end'))}</td>"
+                f"<td class='ipcat-cell' style='padding:5px 10px;text-align:center;vertical-align:middle;{row_ipcat_bg}'>{_size(r.get('ipcat_size_mb'))}</td>"
+            )
+
+            # data-matching is read by filterIpcatLayout() so the Matching /
+            # Mismatching filter checkboxes can show/hide rows client-side.
+            # data-group identifies this row's merge-group for
+            # refreshIpcatMerge() to recompute the visible-rowspan merge.
+            rows_html += (
+                f"<tr class='ipcatlayout-row' data-matching='{matching}' data-group='{run_first}' style='{row_style}'>"
+                f"{ipcat_cells}"
+                f"<td style='padding:5px 10px;text-align:center'>{_name(r.get('target_region'))}</td>"
+                f"<td style='padding:5px 10px;font-family:monospace;font-size:12px;text-align:center'>{_addr(r.get('target_start'))}</td>"
+                f"<td style='padding:5px 10px;font-family:monospace;font-size:12px;text-align:center'>{_addr(r.get('target_end'))}</td>"
+                f"<td style='padding:5px 10px;text-align:center'>{_size(r.get('target_size_mb'))}</td>"
+                f"<td style='padding:5px 10px;text-align:center'>"
+                f"<span style='background:{badge_bg};color:{badge_color};padding:2px 10px;"
+                f"border-radius:10px;font-size:11px;font-weight:600'>{matching}</span></td>"
+                f"</tr>\n"
+            )
+
+        idx = run_first + run_len
+
+    s = data.get("summary", {})
+    chip = data.get("chip", "")
+    total = s.get("total", len(rows_data))
+    matched_count = s.get("matched", 0)
+    mismatched_count = s.get("mismatched", 0)
+    summary_line = (
+        f"<p style='color:#555;font-size:12px;margin:0 0 8px'>"
+        f"{f'<b>Chip:</b> {chip} &nbsp;|&nbsp; ' if chip else ''}"
+        f"<b>Total regions:</b> {total} &nbsp;|&nbsp; "
+        f"Showing <b id='{table_id}-shown-count' style='color:#2c6fad'>{total}</b> of {total}</p>"
+    )
+
+    # Filter checkboxes -- let the user show only Matching or only
+    # Mismatching rows (or both, the default). Mirrors the filter-pill
+    # pattern used by the "Memory Layout" section's filterMemoryLayout().
+    filter_pills = (
+        f"<label style='flex:1 1 0;display:inline-flex;align-items:center;"
+        f"justify-content:center;gap:7px;padding:9px 10px;"
+        f"border:1.5px solid #28a745;border-radius:22px;cursor:pointer;"
+        f"font-size:12.5px;font-weight:600;color:#28a745;background:#fff;"
+        f"user-select:none;white-space:nowrap;"
+        f"box-shadow:0 1px 3px rgba(20,50,90,0.07)'>"
+        f"<input type='checkbox' class='ipcatlayout-filter' value='Yes' "
+        f"data-table='{table_id}' style='accent-color:#28a745;cursor:pointer;margin:0' "
+        f"onchange=\"filterIpcatLayout('{table_id}')\">"
+        f"Matching <span style='opacity:0.6;font-weight:400'>({matched_count})</span>"
+        f"</label>\n"
+        f"<label style='flex:1 1 0;display:inline-flex;align-items:center;"
+        f"justify-content:center;gap:7px;padding:9px 10px;"
+        f"border:1.5px solid #c00000;border-radius:22px;cursor:pointer;"
+        f"font-size:12.5px;font-weight:600;color:#c00000;background:#fff;"
+        f"user-select:none;white-space:nowrap;"
+        f"box-shadow:0 1px 3px rgba(20,50,90,0.07)'>"
+        f"<input type='checkbox' class='ipcatlayout-filter' value='No' "
+        f"data-table='{table_id}' style='accent-color:#c00000;cursor:pointer;margin:0' "
+        f"onchange=\"filterIpcatLayout('{table_id}')\">"
+        f"Mismatching <span style='opacity:0.6;font-weight:400'>({mismatched_count})</span>"
+        f"</label>\n"
+    )
+
+    return f"""
+<div style='max-width:1000px;margin:0 auto'>
+<div style='display:flex;align-items:stretch;gap:12px;margin:0 0 10px;max-width:420px'>
+{filter_pills}
+</div>
+{summary_line}
+<div style='max-height:600px;overflow-y:auto;border:1px solid #d5e0ec;border-radius:6px'>
+<table id='{table_id}' style='width:100%;border-collapse:collapse;font-size:13px;margin:0'>
+<thead><tr style='background:#2c6fad;color:white'>
+  <th style='padding:6px 10px;text-align:center'>IPCat Region</th>
+  <th style='padding:6px 10px;text-align:center'>IPCat Start Address</th>
+  <th style='padding:6px 10px;text-align:center'>IPCat End Address</th>
+  <th style='padding:6px 10px;text-align:center'>IPCat Size (MB)</th>
+  <th style='padding:6px 10px;text-align:center'>Target Region</th>
+  <th style='padding:6px 10px;text-align:center'>Target Start Address</th>
+  <th style='padding:6px 10px;text-align:center'>Target End Address</th>
+  <th style='padding:6px 10px;text-align:center'>Target Size (MB)</th>
+  <th style='padding:6px 10px;text-align:center'>Matching</th>
+</tr></thead>
+<tbody>
+{rows_html}
+</tbody>
+</table>
+</div>
+</div>
+<script>
+// Apply the IPCat-side rowspan merge on initial page render (every row is
+// rendered with its own full set of IPCat cells by default -- this call
+// establishes the initial merged/grouped appearance before any filter
+// interaction, and is safe to re-run any number of times).
+refreshIpcatMerge('{table_id}');
+</script>"""
+
+
 def render_comparison_html(data: dict) -> str:
     # Detect standalone mode (self-comparison)
     is_standalone = (
@@ -1455,6 +1717,7 @@ def _section_title_for(rtype: str, data: dict) -> str:
         "snapshot_comparison": "Memory Delta Summary",
         "kernel_diff":         "Kernel Memory Changes",
         "userspace_diff":      "Userspace Memory Changes",
+        "ipcat_layout":        "IPCat Memory Layout",
     }
     title = titles.get(rtype, f"Report ({rtype})")
     # Override for standalone mode (self-comparison)
@@ -1474,6 +1737,7 @@ SECTION_RENDERERS = {
     "snapshot_comparison": ("Memory Delta Summary",         render_comparison_html),
     "kernel_diff":         ("Kernel Memory Changes",        render_kernel_diff_html),
     "userspace_diff":      ("Userspace Memory Changes",     render_userspace_diff_html),
+    "ipcat_layout":        ("IPCat Memory Layout",          render_ipcat_layout_html),
 }
 
 
@@ -1970,6 +2234,40 @@ def write_xlsx_unified(sections: list[tuple[str, str, dict]], output_path: str):
             for p in data.get("exited_processes", []):
                 ws.append([p["name"], p.get("pss_kb", 0), 0, -p.get("pss_kb", 0), "", "EXITED"])
                 ws[ws.max_row][5].fill = PatternFill("solid", fgColor="FDE8E8")
+
+        elif rtype == "ipcat_layout":
+            ws.append(["IPCat Region", "IPCat Start Address", "IPCat End Address", "IPCat Size (MB)",
+                       "Target Region", "Target Start Address", "Target End Address",
+                       "Target Size (MB)", "Matching"])
+            for cell in ws[ws.max_row]:
+                cell.font = Font(bold=True)
+            match_fill    = PatternFill("solid", fgColor="D4EDDA")
+            mismatch_fill = PatternFill("solid", fgColor="F8D7DA")
+
+            def _addr_cell(v):
+                return hex(v) if isinstance(v, int) else ("" if v is None else v)
+
+            for r in data.get("rows", []):
+                ws.append([
+                    r.get("region") or "",
+                    _addr_cell(r.get("ipcat_start")),
+                    _addr_cell(r.get("ipcat_end")),
+                    r.get("ipcat_size_mb") if r.get("ipcat_size_mb") is not None else "",
+                    r.get("target_region") or "",
+                    _addr_cell(r.get("target_start")),
+                    _addr_cell(r.get("target_end")),
+                    r.get("target_size_mb") if r.get("target_size_mb") is not None else "",
+                    r.get("matching", "No"),
+                ])
+                fill = match_fill if r.get("matching") == "Yes" else mismatch_fill
+                for cell in ws[ws.max_row]:
+                    cell.fill = fill
+            for col_letter in ("A", "E"):
+                ws.column_dimensions[col_letter].width = 24
+            for col_letter in ("B", "C", "F", "G"):
+                ws.column_dimensions[col_letter].width = 20
+            for col_letter in ("D", "H", "I"):
+                ws.column_dimensions[col_letter].width = 14
 
     wb.save(output_path)
     print(f"[report-generation] XLSX  -> {output_path}")

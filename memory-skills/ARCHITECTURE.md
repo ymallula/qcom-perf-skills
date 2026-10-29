@@ -219,10 +219,15 @@ memory-skills/
 │   │   └── scripts/
 │   │       └── memory_map.py
 │   │
-│   └── nhlos-carveout-validation/ # Supporting: NHLOS carveout layout reporter
+│   ├── nhlos-carveout-validation/ # Supporting: NHLOS carveout layout reporter
+│   │   ├── README.md
+│   │   └── scripts/
+│   │       └── validate.py
+│   │
+│   └── ipcat-memory-layout/     # Supporting: IPCat vs device memory layout comparison
 │       ├── README.md
 │       └── scripts/
-│           └── validate.py
+│           └── ipcat_layout.py
 │
 ├── common/                      # Shared JSON schemas
 │   └── schema/

@@ -61,7 +61,8 @@ memory-skills/
 │   ├── anomaly-rca/
 │   ├── report-generation/
 │   ├── memory-map/
-│   └── nhlos-carveout-validation/
+│   ├── nhlos-carveout-validation/
+│   └── ipcat-memory-layout/
 ├── common/                    ← Shared schemas
 ├── tests/                     ← Validation tests
 ├── README.md
@@ -251,6 +252,7 @@ Each analysis mode orchestrates the following skills in sequence:
 | **report-generation** | Generate unified HTML/XLSX report | `internal/report-generation/scripts/generate_report.py` |
 | **memory-map** | Physical memory layout (NHLOS + HLOS breakdown) | `internal/memory-map/scripts/` |
 | **nhlos-carveout-validation** | Parse and report NHLOS carveout layout from device tree | `internal/nhlos-carveout-validation/scripts/` |
+| **ipcat-memory-layout** | Compare device memory layout against IP Catalog (IPCat) reference map | `internal/ipcat-memory-layout/scripts/ipcat_layout.py` |
 
 ---
 
